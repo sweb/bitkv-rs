@@ -112,8 +112,7 @@ impl KvStore {
             let (writer, reader) = new_log_file(&self.directory, new_generation)?;
 
             self.writer = writer;
-            self.readers
-                .insert(new_generation, reader);
+            self.readers.insert(new_generation, reader);
             self.current_generation = new_generation;
             pos = self.writer.stream_position()?;
         }
@@ -162,24 +161,82 @@ impl KvStore {
             let (writer, reader) = new_log_file(&self.directory, new_generation)?;
 
             self.writer = writer;
-            self.readers
-                .insert(new_generation, reader);
+            self.readers.insert(new_generation, reader);
             self.current_generation = new_generation;
         }
         serde_json::to_writer(&mut self.writer, &cmd)?;
         self.index.remove(&key);
         Ok(())
     }
+
+    pub fn compact(&mut self) -> Result<()> {
+        let compaction_generation = self.current_generation + 1;
+        self.current_generation += 2;
+        let (writer, reader) = new_log_file(&self.directory, self.current_generation)?;
+        self.writer = writer;
+        self.readers.insert(self.current_generation, reader);
+
+        let (mut comp_writer, comp_reader) = new_log_file(&self.directory, compaction_generation)?;
+        let mut compaction_generations: Vec<u64> = self
+            .readers
+            .keys()
+            .copied()
+            .filter(|g| g < &compaction_generation)
+            .collect();
+        compaction_generations.sort();
+        let mut new_index: HashMap<String, CommandPos> = HashMap::new();
+        for gen_id in &compaction_generations {
+            let path = self.directory.join(format!("{}.db", gen_id));
+            let mut reader = BufReader::new(fs::OpenOptions::new().read(true).open(&path)?);
+            let mut read_pos = reader.seek(SeekFrom::Start(0))?;
+            let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
+
+            while let Some(command) = stream.next() {
+                let c = command?;
+                if let Command::Set { key, .. } = &c {
+                    if let Some(live_record) = self.index.get(key) {
+                        if live_record.generation == *gen_id && live_record.pos == read_pos {
+                            let pos = comp_writer.stream_position()?;
+                            serde_json::to_writer(&mut comp_writer, &c)?;
+                            let new_pos = comp_writer.stream_position()?;
+                            let len = new_pos - pos;
+                            let new_cmd_pos = CommandPos {
+                                pos,
+                                len,
+                                generation: compaction_generation,
+                            };
+                            new_index.insert(key.clone(), new_cmd_pos);
+                        }
+                    }
+                }
+                read_pos = stream.byte_offset() as u64;
+            }
+        }
+        comp_writer.flush()?;
+        for gen_id in &compaction_generations {
+            self.readers.remove(&gen_id);
+        }
+        for (k, v) in new_index {
+            self.index.insert(k, v);
+        }
+        self.readers.insert(compaction_generation, comp_reader);
+        for gen_id in &compaction_generations {
+            fs::remove_file(self.directory.join(format!("{}.db", gen_id)))?;
+        }
+        Ok(())
+    }
 }
 
 fn new_log_file(dir: &Path, generation: u64) -> io::Result<(BufWriter<File>, BufReader<File>)> {
     let path = dir.join(format!("{}.db", generation));
-    let writer = BufWriter::new(fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .append(true)
-        .open(&path)?);
+    let writer = BufWriter::new(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&path)?,
+    );
     let reader = BufReader::new(fs::OpenOptions::new().read(true).open(&path)?);
     Ok((writer, reader))
 }

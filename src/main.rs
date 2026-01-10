@@ -13,6 +13,7 @@ fn main() {
     store.remove("user1".to_string()).unwrap();
     let val = store.get("user1".to_string()).unwrap();
     println!("Got value: {:?}", val); // Should be Some("Alice")
+    store.compact().unwrap();
 
     // Restart logic:
     // If you run this code twice, the file "log.db" will persist.
