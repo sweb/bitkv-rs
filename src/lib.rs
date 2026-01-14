@@ -33,7 +33,7 @@ pub struct KvStore {
 struct SharedData {
     index: HashMap<String, CommandPos>,
     directory: PathBuf,
-    readers: HashMap<u64, BufReader<fs::File>>,
+    readers: std::collections::BTreeMap<u64, Mutex<BufReader<fs::File>>>,
     current_generation: u64,
 }
 
@@ -41,7 +41,7 @@ impl KvStore {
     pub fn open(directory: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
         let generation_files = fs::read_dir(&directory)?;
-        let mut readers = HashMap::new();
+        let mut readers = std::collections::BTreeMap::new();
         for dir_entry in generation_files {
             let path = dir_entry?.path();
             if path.extension() != Some(std::ffi::OsStr::new("db")) {
@@ -56,10 +56,10 @@ impl KvStore {
                 None => continue,
             };
             let file = fs::OpenOptions::new().read(true).open(path)?;
-            readers.insert(generation, BufReader::new(file));
+            readers.insert(generation, Mutex::new(BufReader::new(file)));
         }
         // We always create a new generation on start up
-        let current_generation = readers.keys().max().copied().unwrap_or(0) + 1;
+        let current_generation = readers.keys().last().copied().unwrap_or(0) + 1;
         let (writer, reader) = new_log_file(&directory, current_generation)?;
         readers.insert(current_generation, reader);
 
@@ -85,14 +85,13 @@ impl KvStore {
             ref mut index,
             ..
         } = *inner_guard;
-        let mut generations: Vec<u64> = readers.keys().copied().collect();
-        generations.sort();
 
-        for generation in generations {
-            if let Some(reader) = readers.get_mut(&generation) {
-                let mut pos = reader.seek(SeekFrom::Start(0))?;
+        for generation in readers.keys() {
+            if let Some(reader) = readers.get(&generation) {
+                let mut reader_guard = reader.lock().unwrap();
+                let mut pos = reader_guard.seek(SeekFrom::Start(0))?;
                 let mut stream =
-                    serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
+                    serde_json::Deserializer::from_reader(&mut *reader_guard).into_iter::<Command>();
 
                 while let Some(command) = stream.next() {
                     let c = command?;
@@ -103,7 +102,7 @@ impl KvStore {
                             let cmd_pos = CommandPos {
                                 pos,
                                 len,
-                                generation,
+                                generation: *generation,
                             };
                             index.insert(key, cmd_pos);
                         }
@@ -161,16 +160,17 @@ impl KvStore {
         Ok(())
     }
 
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let mut inner = self.inner.write().unwrap();
+    pub fn get(&self, key: String) -> Result<Option<String>> {
+        let inner = self.inner.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         let cmd_pos = match inner.index.get(&key) {
             Some(value) => *value,
             None => return Ok(None),
         };
-        if let Some(reader) = inner.readers.get_mut(&cmd_pos.generation) {
-            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-            let reader = reader.take(cmd_pos.len);
-            let cmd = serde_json::from_reader(reader)?;
+        if let Some(reader) = inner.readers.get(&cmd_pos.generation) {
+            let mut reader_guard = reader.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+            reader_guard.seek(SeekFrom::Start(cmd_pos.pos))?;
+            let reader_guard = (&mut *reader_guard).take(cmd_pos.len);
+            let cmd = serde_json::from_reader(reader_guard)?;
             match cmd {
                 Command::Set { value, .. } => Ok(Some(value)),
                 _ => Ok(None),
@@ -185,9 +185,9 @@ impl KvStore {
 
     pub fn remove(&mut self, key: String) -> Result<()> {
         let cmd = Command::Remove { key: key.clone() };
-        let pos = self.writer.lock().unwrap().stream_position()?;
+        let pos = self.writer.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?.stream_position()?;
         if pos > SPLIT_LIMIT {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
             if inner.readers.len() as u64 > COMPACT_LIMIT {
                 drop(inner);
                 self.compact()?;
@@ -200,9 +200,9 @@ impl KvStore {
                 inner.current_generation = new_generation;
             }
         }
-        let mut writer_guard = self.writer.lock().unwrap();
+        let mut writer_guard = self.writer.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
         serde_json::to_writer(&mut *writer_guard, &cmd)?;
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         inner.index.remove(&key);
         Ok(())
     }
@@ -217,13 +217,12 @@ impl KvStore {
         inner.readers.insert(current_generation, reader);
 
         let (mut comp_writer, comp_reader) = new_log_file(&inner.directory, compaction_generation)?;
-        let mut compaction_generations: Vec<u64> = inner
+        let compaction_generations: Vec<u64> = inner
             .readers
             .keys()
             .copied()
             .filter(|g| g < &compaction_generation)
             .collect();
-        compaction_generations.sort();
         let thread_generations = compaction_generations.clone();
         let thread_inner = self.inner.clone();
         let directory = inner.directory.clone();
@@ -293,7 +292,7 @@ impl KvStore {
     }
 }
 
-fn new_log_file(dir: &Path, generation: u64) -> io::Result<(BufWriter<File>, BufReader<File>)> {
+fn new_log_file(dir: &Path, generation: u64) -> io::Result<(BufWriter<File>, Mutex<BufReader<File>>)> {
     let path = dir.join(format!("{}.db", generation));
     let writer = BufWriter::new(
         fs::OpenOptions::new()
@@ -304,5 +303,5 @@ fn new_log_file(dir: &Path, generation: u64) -> io::Result<(BufWriter<File>, Buf
             .open(&path)?,
     );
     let reader = BufReader::new(fs::OpenOptions::new().read(true).open(&path)?);
-    Ok((writer, reader))
+    Ok((writer, Mutex::new(reader)))
 }
