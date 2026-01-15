@@ -14,9 +14,4 @@ fn main() {
     let val = store.get("user1").unwrap();
     println!("Got value: {:?}", val); // Should be Some("Alice")
     store.compact().unwrap();
-
-    // Restart logic:
-    // If you run this code twice, the file "log.db" will persist.
-    // The second time you run it, `open` will replay the log
-    // and remember "Alice" even before you set it again.
 }
