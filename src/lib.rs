@@ -79,7 +79,10 @@ impl KvStore {
     }
 
     fn load(&mut self) -> io::Result<()> {
-        let mut inner_guard = self.inner.write().unwrap();
+        let mut inner_guard = self
+            .inner
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         let SharedData {
             ref mut readers,
             ref mut index,
@@ -88,10 +91,12 @@ impl KvStore {
 
         for generation in readers.keys() {
             if let Some(reader) = readers.get(&generation) {
-                let mut reader_guard = reader.lock().unwrap();
+                let mut reader_guard = reader
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
                 let mut pos = reader_guard.seek(SeekFrom::Start(0))?;
-                let mut stream =
-                    serde_json::Deserializer::from_reader(&mut *reader_guard).into_iter::<Command>();
+                let mut stream = serde_json::Deserializer::from_reader(&mut *reader_guard)
+                    .into_iter::<Command>();
 
                 while let Some(command) = stream.next() {
                     let c = command?;
@@ -122,24 +127,39 @@ impl KvStore {
             key: key.clone(),
             value,
         };
-        let mut writer_guard = self.writer.lock().unwrap();
+        let mut writer_guard = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
         let mut pos = writer_guard.stream_position()?;
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         if pos > SPLIT_LIMIT {
             drop(writer_guard);
             if inner.readers.len() as u64 > COMPACT_LIMIT {
                 drop(inner);
                 self.compact()?;
-                writer_guard = self.writer.lock().unwrap();
+                writer_guard = self
+                    .writer
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
                 pos = writer_guard.stream_position()?;
-                inner = self.inner.write().unwrap();
+                inner = self
+                    .inner
+                    .write()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
             } else {
                 let new_generation = inner.current_generation + 1;
                 let (writer, reader) = new_log_file(&inner.directory, new_generation)?;
                 inner.readers.insert(new_generation, reader);
                 inner.current_generation = new_generation;
                 self.writer = Arc::new(Mutex::new(writer));
-                writer_guard = self.writer.lock().unwrap();
+                writer_guard = self
+                    .writer
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
                 pos = writer_guard.stream_position()?;
             }
         }
@@ -161,13 +181,18 @@ impl KvStore {
     }
 
     pub fn get(&self, key: String) -> Result<Option<String>> {
-        let inner = self.inner.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         let cmd_pos = match inner.index.get(&key) {
             Some(value) => *value,
             None => return Ok(None),
         };
         if let Some(reader) = inner.readers.get(&cmd_pos.generation) {
-            let mut reader_guard = reader.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+            let mut reader_guard = reader
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
             reader_guard.seek(SeekFrom::Start(cmd_pos.pos))?;
             let reader_guard = (&mut *reader_guard).take(cmd_pos.len);
             let cmd = serde_json::from_reader(reader_guard)?;
@@ -185,9 +210,16 @@ impl KvStore {
 
     pub fn remove(&mut self, key: String) -> Result<()> {
         let cmd = Command::Remove { key: key.clone() };
-        let pos = self.writer.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?.stream_position()?;
+        let pos = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?
+            .stream_position()?;
         if pos > SPLIT_LIMIT {
-            let mut inner = self.inner.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+            let mut inner = self
+                .inner
+                .write()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
             if inner.readers.len() as u64 > COMPACT_LIMIT {
                 drop(inner);
                 self.compact()?;
@@ -200,15 +232,24 @@ impl KvStore {
                 inner.current_generation = new_generation;
             }
         }
-        let mut writer_guard = self.writer.lock().map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+        let mut writer_guard = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
         serde_json::to_writer(&mut *writer_guard, &cmd)?;
-        let mut inner = self.inner.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         inner.index.remove(&key);
         Ok(())
     }
 
     pub fn compact(&mut self) -> Result<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
         let compaction_generation = inner.current_generation + 1;
         inner.current_generation += 2;
         let (writer, reader) = new_log_file(&inner.directory, inner.current_generation)?;
@@ -265,7 +306,9 @@ impl KvStore {
                     );
                 }
                 comp_writer.flush()?;
-                let mut inner_guard = thread_inner.write().unwrap();
+                let mut inner_guard = thread_inner
+                    .write()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
                 for gen_id in &thread_generations {
                     inner_guard.readers.remove(&gen_id);
                 }
@@ -292,7 +335,10 @@ impl KvStore {
     }
 }
 
-fn new_log_file(dir: &Path, generation: u64) -> io::Result<(BufWriter<File>, Mutex<BufReader<File>>)> {
+fn new_log_file(
+    dir: &Path,
+    generation: u64,
+) -> io::Result<(BufWriter<File>, Mutex<BufReader<File>>)> {
     let path = dir.join(format!("{}.db", generation));
     let writer = BufWriter::new(
         fs::OpenOptions::new()
