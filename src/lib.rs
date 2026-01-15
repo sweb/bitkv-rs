@@ -123,10 +123,7 @@ impl KvStore {
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set {
-            key: key.clone(),
-            value,
-        };
+        let cmd = Command::Set { key, value };
         let mut writer_guard = self
             .writer
             .lock()
@@ -169,23 +166,25 @@ impl KvStore {
         let len = ending_position - pos;
 
         let generation = inner.current_generation;
-        inner.index.insert(
-            key,
-            CommandPos {
-                pos,
-                len,
-                generation,
-            },
-        );
+        if let Command::Set { key, .. } = cmd {
+            inner.index.insert(
+                key,
+                CommandPos {
+                    pos,
+                    len,
+                    generation,
+                },
+            );
+        }
         Ok(())
     }
 
-    pub fn get(&self, key: String) -> Result<Option<String>> {
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
         let inner = self
             .inner
             .read()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
-        let cmd_pos = match inner.index.get(&key) {
+        let cmd_pos = match inner.index.get(key) {
             Some(value) => *value,
             None => return Ok(None),
         };
@@ -208,8 +207,8 @@ impl KvStore {
         }
     }
 
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        let cmd = Command::Remove { key: key.clone() };
+    pub fn remove(&mut self, key: impl Into<String>) -> Result<()> {
+        let cmd = Command::Remove { key: key.into() };
         let pos = self
             .writer
             .lock()
@@ -241,7 +240,9 @@ impl KvStore {
             .inner
             .write()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
-        inner.index.remove(&key);
+        if let Command::Remove { key } = cmd {
+            inner.index.remove(&key);
+        };
         Ok(())
     }
 
@@ -264,13 +265,12 @@ impl KvStore {
             .copied()
             .filter(|g| g < &compaction_generation)
             .collect();
-        let thread_generations = compaction_generations.clone();
         let thread_inner = self.inner.clone();
         let directory = inner.directory.clone();
         std::thread::spawn(move || {
             let try_compact = || -> std::io::Result<()> {
                 let mut compacted_map: HashMap<String, String> = HashMap::new();
-                for gen_id in &thread_generations {
+                for gen_id in &compaction_generations {
                     let path = directory.join(format!("{}.db", gen_id));
                     let reader = BufReader::new(fs::OpenOptions::new().read(true).open(&path)?);
                     let mut stream =
@@ -290,26 +290,25 @@ impl KvStore {
                 let mut new_pos_map = HashMap::new();
                 for (key, value) in compacted_map {
                     let pos = comp_writer.stream_position()?;
-                    let cmd = Command::Set {
-                        key: key.clone(),
-                        value,
-                    };
+                    let cmd = Command::Set { key, value };
                     serde_json::to_writer(&mut comp_writer, &cmd)?;
                     let len = comp_writer.stream_position()? - pos;
-                    new_pos_map.insert(
-                        key,
-                        CommandPos {
-                            pos,
-                            len,
-                            generation: compaction_generation,
-                        },
-                    );
+                    if let Command::Set { key, .. } = cmd {
+                        new_pos_map.insert(
+                            key,
+                            CommandPos {
+                                pos,
+                                len,
+                                generation: compaction_generation,
+                            },
+                        );
+                    }
                 }
                 comp_writer.flush()?;
                 let mut inner_guard = thread_inner
                     .write()
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
-                for gen_id in &thread_generations {
+                for gen_id in &compaction_generations {
                     inner_guard.readers.remove(&gen_id);
                 }
                 inner_guard
@@ -317,12 +316,12 @@ impl KvStore {
                     .insert(compaction_generation, comp_reader);
                 for (k, new_pos) in new_pos_map {
                     if let Some(current_pos) = inner_guard.index.get(&k) {
-                        if thread_generations.contains(&current_pos.generation) {
+                        if compaction_generations.contains(&current_pos.generation) {
                             inner_guard.index.insert(k, new_pos);
                         }
                     }
                 }
-                for gen_id in &thread_generations {
+                for gen_id in &compaction_generations {
                     fs::remove_file(directory.join(format!("{}.db", gen_id)))?;
                 }
                 Ok(())
