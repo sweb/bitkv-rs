@@ -3,8 +3,10 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Result, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, RwLockWriteGuard},
 };
+
+pub mod protocol;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +29,6 @@ struct CommandPos {
 #[derive(Clone)]
 pub struct KvStore {
     inner: Arc<RwLock<SharedData>>,
-    writer: Arc<Mutex<BufWriter<fs::File>>>,
 }
 
 struct SharedData {
@@ -35,6 +36,8 @@ struct SharedData {
     directory: PathBuf,
     readers: std::collections::BTreeMap<u64, Mutex<BufReader<fs::File>>>,
     current_generation: u64,
+    compacting: bool,
+    writer: Mutex<BufWriter<fs::File>>,
 }
 
 impl KvStore {
@@ -69,10 +72,11 @@ impl KvStore {
             directory,
             readers,
             current_generation,
+            compacting: false,
+            writer: Mutex::new(writer),
         };
         let mut store = KvStore {
             inner: Arc::new(RwLock::new(data)),
-            writer: Arc::new(Mutex::new(writer)),
         };
         store.load()?;
         Ok(store)
@@ -124,36 +128,35 @@ impl KvStore {
 
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let cmd = Command::Set { key, value };
-        let mut writer_guard = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
-        let mut pos = writer_guard.stream_position()?;
         let mut inner = self
             .inner
             .write()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+
+        let mut writer_guard = inner
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+        let mut pos = writer_guard.stream_position()?;
+        println!("pos is {}", pos);
+        
         if pos > SPLIT_LIMIT {
             drop(writer_guard);
+            println!("number of readers is {}", inner.readers.len());
             if inner.readers.len() as u64 > COMPACT_LIMIT {
-                drop(inner);
-                self.compact()?;
-                writer_guard = self
+                self.compact_locked(&mut inner)?;
+                writer_guard = inner
                     .writer
                     .lock()
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
                 pos = writer_guard.stream_position()?;
-                inner = self
-                    .inner
-                    .write()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
             } else {
                 let new_generation = inner.current_generation + 1;
                 let (writer, reader) = new_log_file(&inner.directory, new_generation)?;
                 inner.readers.insert(new_generation, reader);
                 inner.current_generation = new_generation;
-                self.writer = Arc::new(Mutex::new(writer));
-                writer_guard = self
+                inner.writer = Mutex::new(writer);
+                writer_guard = inner
                     .writer
                     .lock()
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
@@ -164,8 +167,10 @@ impl KvStore {
         writer_guard.flush()?;
         let ending_position = writer_guard.stream_position()?;
         let len = ending_position - pos;
-
         let generation = inner.current_generation;
+
+        drop(writer_guard); // Release writer lock
+
         if let Command::Set { key, .. } = cmd {
             inner.index.insert(
                 key,
@@ -209,37 +214,39 @@ impl KvStore {
 
     pub fn remove(&mut self, key: impl Into<String>) -> Result<()> {
         let cmd = Command::Remove { key: key.into() };
-        let pos = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?
-            .stream_position()?;
-        if pos > SPLIT_LIMIT {
-            let mut inner = self
-                .inner
-                .write()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
-            if inner.readers.len() as u64 > COMPACT_LIMIT {
-                drop(inner);
-                self.compact()?;
-            } else {
-                let new_generation = inner.current_generation + 1;
-                let (writer, reader) = new_log_file(&inner.directory, new_generation)?;
-
-                self.writer = Arc::new(Mutex::new(writer));
-                inner.readers.insert(new_generation, reader);
-                inner.current_generation = new_generation;
-            }
-        }
-        let mut writer_guard = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
-        serde_json::to_writer(&mut *writer_guard, &cmd)?;
         let mut inner = self
             .inner
             .write()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+
+        let mut writer_guard = inner
+            .writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+        let pos = writer_guard.stream_position()?;
+
+        if pos > SPLIT_LIMIT {
+            drop(writer_guard);
+            if inner.readers.len() as u64 > COMPACT_LIMIT {
+                self.compact_locked(&mut inner)?;
+            } else {
+                let new_generation = inner.current_generation + 1;
+                let (writer, reader) = new_log_file(&inner.directory, new_generation)?;
+
+                inner.writer = Mutex::new(writer);
+                inner.readers.insert(new_generation, reader);
+                inner.current_generation = new_generation;
+            }
+            writer_guard = inner
+                .writer
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Mutex poisoned"))?;
+        }
+        
+        serde_json::to_writer(&mut *writer_guard, &cmd)?;
+        writer_guard.flush()?;
+        drop(writer_guard); // Release writer lock
+
         if let Command::Remove { key } = cmd {
             inner.index.remove(&key);
         };
@@ -251,10 +258,19 @@ impl KvStore {
             .inner
             .write()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "RwLock poisoned"))?;
+        self.compact_locked(&mut inner)
+    }
+
+    fn compact_locked(&self, inner: &mut RwLockWriteGuard<SharedData>) -> Result<()> {
+        if inner.compacting {
+            return Ok(());
+        }
+        inner.compacting = true;
+
         let compaction_generation = inner.current_generation + 1;
         inner.current_generation += 2;
         let (writer, reader) = new_log_file(&inner.directory, inner.current_generation)?;
-        self.writer = Arc::new(Mutex::new(writer));
+        inner.writer = Mutex::new(writer);
         let current_generation = inner.current_generation;
         inner.readers.insert(current_generation, reader);
 
@@ -265,6 +281,7 @@ impl KvStore {
             .copied()
             .filter(|g| g < &compaction_generation)
             .collect();
+        println!("Spawning compaction for generations: {:?}", compaction_generations);
         let thread_inner = self.inner.clone();
         let directory = inner.directory.clone();
         std::thread::spawn(move || {
@@ -321,6 +338,7 @@ impl KvStore {
                         }
                     }
                 }
+                inner_guard.compacting = false;
                 for gen_id in &compaction_generations {
                     fs::remove_file(directory.join(format!("{}.db", gen_id)))?;
                 }
@@ -328,6 +346,7 @@ impl KvStore {
             };
             if let Err(e) = try_compact() {
                 eprintln!("Compaction failed: {}", e);
+                let _ = thread_inner.write().map(|mut inner| inner.compacting = false);
             }
         });
         Ok(())
